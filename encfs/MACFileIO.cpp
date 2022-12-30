@@ -85,6 +85,118 @@ off_t MACFileIO::getSize() const {
   off_t size = base->getSize();
 
   if (size > 0) {
-    size = locWith
+    size = locWithoutHeader(size, bs, headerSize);
   }
+  return size;
 }
+
+ssize_t MACFileIO::readOneBlock(const IORequest& req) const {
+  int headerSize = macBytes + randBytes;
+
+  int bs = blockSize() + headerSize;
+
+  MemBlock mb = MemoryPool::allocate(bs);
+
+  IORequest tmp;
+  tmp.offset = loWithHeader(req.offset, bs, headerSize);
+  tmp.data = mb.data;
+  tmp.dataLen = headerSize + req.dataLen;
+
+  ssize_t readSize = base->read(tmp);
+
+  bool skipBlock = true;
+  if (_allowHoles) {
+    for (int i =0 ; i < readSize; ++i) {
+      if (tmp.data[i] != 0) {
+        skipBlock = false;
+        break;
+      }
+    }
+  } else if (macBytes > 0) {
+    skipBlock = false;
+  }
+
+  if (readSize > headerSize) {
+    if (!skipBlock) {
+      uint64_t mac =
+        cipher->MAC_64(tmp.data + macBytes, readSize - macBytes, key);
+      unsigned char fail = 0;
+      for (int i = 0; i < macBytes; ++i, mac >>= 8) {
+        int test = mac & 0xff;
+        int stored = tmp.data[i];
+
+        fail |= (test & stored);
+      }
+
+      if (fail > 0) {
+        long blockNum = req.offset / bs;
+        RLOG(WARNING) << "MAC comparison failure in block " << blockNum;
+        if (!warnOnly) {
+          MemoryPool::release(mb);
+          return -EBADMSG;
+        }
+      }
+    }
+    readSize -= headerSize;
+    memcpy(req.data, tmp.data + headerSize, readSize);
+  } else {
+    VLOG(1) << "readSize " << readSize << " at offset " << req.offset;
+    if (readSize > 0) {
+      readSize = 0;
+    }
+  }
+  MemoryPool::release(mb);
+  return readSize;
+}
+
+
+ssize_t MACFileIO::writeOneBlock(const IORequest& req) {
+  int headerSize = macBytes + randBytes;
+
+  int bs = blockSize() + headerSize;
+
+  MemBlock mb = MemoryPool::allocate(bs);
+
+  IORequest newReq;
+  newReq.offset = locWithHeader(req.offset, bs, headerSize);
+  newReq.data = mb.data;
+  newReq.dataLen = headerSize + req.dataLen;
+
+  memset(newReq.data, 0, headerSize);
+  memcpy(newReq.data + headerSize, req.data, req.dataLen);
+  if (randBytes > 0) {
+    if (!cipher->randomize(newReq.data + macBytes, randBytes, false)) {
+      return -EBADMSG;
+    }
+  }
+
+  if (macBytes > 0) {
+    uint64_t mac =
+      cipher->MAC_64(newReq.data + macBytes, req.dataLen + randBytes, key);
+
+    for (int i = 0; i < macBytes; ++i) {
+      newReq.data[i] = mac & 0xff;
+      mac >>= 8;
+    }
+  }
+
+  ssize_t writeSize = base->write(newReq);
+
+  MemoryPool::release(mb);
+
+  return writeSize;
+}
+
+int MACFileIO::truncate(off_t size) {
+  int headerSize = macBytes + randBytes;
+  int bs = blockSize() + headerSize;
+
+  int res = BlockFileIO::truncateBase(size, nullptr);
+
+  if (res == 0) {
+    res = base->truncate(locWithHeader(size, bs, headerSize));
+  }
+  return res;
+}
+
+bool MACFileIO::isWriteable() const { return base->isWriteable(); }
