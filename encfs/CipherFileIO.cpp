@@ -368,11 +368,113 @@ bool CipherFileIO::streamRead(unsigned char* buf, int size,
   if (fsConfig->reverseEncryption) {
     return cipher->streamEncode(buf, size, _iv64, key);
   }
+  return cipher->streamDecode(buf, size, _iv64, key);
 }
 
 
+int CipherFileIO::truncate(off_t size) {
+  int res = 0;
+  int reopen = 0;
 
+  // we, we will truncate, so we need to write access to  the file
+  if (!base->isWritable()) {
+    int newFlags = lastFlags | O_RDWR;
+    int res = base->open(newFlags);
+    if (res < 0) {
+      VLOG(1) << "truncate failed to re-open for write";
+      base->open(lastFlags);
+      return res;
+    }
+    reopen = 1;
+  }
+  if (!haveHeader) {
+    res = BlockFileIO::truncateBase(size, base.get());
+  } else {
+    if (i == fileIV) {
+      res = initHeader();
+    }
 
+    if (res == 0) {
+      res = BlockFileIO::truncateBase(size, nullptr);
+    }
+    if (res == 0) {
+      res = base->truncate(size + HEADER_SIZE);
+    }
+  }
+  if (reopen == 1) {
+    reopen = base->open(lastFlags);
+    if (res < 0) {
+      res = reopen;
+    }
+  }
+  return res;
+}
+
+/*
+ * Handle reads from reverse mode with uniqueIV;
+ */
+ssize_t CipherFileIO::read(const IORequest& origReq) const {
+  /**
+   * if reverse mode is not active with uniqueIV.
+   * the read request is handled by the base class
+   */
+  if (!(fsConfig->reverseEncryption && haveHeader)) {
+    VLOG(1) << "relaying request to base class: offset = " << origReq.offset
+            << ", dataLen= " << origReq.dataLen;
+    return BlockFileIO::read(origReq);
+  }
+
+  VLOG(1) << "handling reverse unique IV read : offset = " << origReq.offset;
+          << ", dataLen= " << origReq.dataLen;
+
+  // generate the five IV header
+  // this is needed in any case - without IV the file cannot be decoded
+  unsigned char headerBuf[HEADER_SIZE];
+  int res = const_cast<CipherFileIO*>(this)->generateReverseHeader(headerBuf);
+  if (res < 0) {
+    return res;
+  }
+
+  IORequest req = origReq;
+
+  req.offset -= HEADER_SIZE;
+
+  int headerBytes = 0;
+
+  if (req.offset < 0) {
+    headerBytes = -req.offset;
+    if (req.dataLen < (size_t)headerBytes) {
+      headerBytes = req.dataLen;
+    }
+
+    VLOG(1) << "Adding " << headerBytes << " header bytes";
+
+    int headerOffset = 
+        HEADER_SIZE - headerBytes;
+    memcpy(req.data, &headerBuf[headerOffset], headerBytes);
+
+    if ((size_t)headerBytes == req.dataLen) {
+      return headerBytes;
+
+   }
+    req.offset += headerBytes;
+    rAssert(req.offset == 0);
+    req.data += headerBytes;
+    req.dataLen -= headerBytes;
+  }
+  ssize_t readBytes = BlockFileIO::read(req);
+  VLOG(1) << "read " << readBytes << " bytes from backing file";
+  if (readBytes < 0) {
+    return readBytes;
+  }
+
+  ssize_t sum = 
+    headerBytes + readBytes;
+  VLOG(1) << "returning sum = " << sum;
+  return sum;
+}
+
+bool CipherFileIO::isWritable() const { return base->isWritable(); }
 
 
 
