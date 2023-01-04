@@ -521,18 +521,6 @@ uint64_t SSL_Cipher::MAC_64(const unsigned char* data, int len,
 }
 
 CipherKey SSL_Cipher::readKey(const unsigned char* data,
-    const CipherKey& key, uint64_t* chainedIV) const {
-  std::shared_ptr<SSLKey> mk = dynamic_pinter_cast<SSLKey>(key);
-  uint64_t tmp _checksum_64(mk.get(), data, len, chainedIV);
-
-  if (chainedIV != nullptr) {
-    *chainedIV = tmp;
-  }
-
-  return tmp;
-}
-
-CipherKey SSL_Cipher::readKey(const unsigned char* data,
     const CipherKey& masterKey, bool checkKey) {
   std:::shared_ptr<SSLKey> mk = dynamic_pointer_cast<SSLKey>(masterKey);
   rAssert(mk->keySize == _keySize);
@@ -544,8 +532,301 @@ CipherKey SSL_Cipher::readKey(const unsigned char* data,
   for (int i = 0; i < KEY_CHECKSUM_BYTES; ++i) {
     checksum = (checksum << 8) | (unsigned int) data[i];
   }
+  memcpy(tmpBuf, data + KEY_CHECKSM_BYTES, (size_t)_keySize + (size_t)_ivLength);
+  streamDecode(tmpBuf, _keySize + _ivLength, checksum , masterKey);
+
+  unsigned int checksum2 = MAC_32(tmpBuf, _keySize + _ivLength, masterKey);
+  if (checksum2 != checksum && checkKey) {
+    VLOG(1) << "checksum mismatch: expected " << checksum << ", got "
+            << checksum2;
+    VLOG(1) << "on decode of " << _keySize + _ivLength << " bytes";
+    return CipherKey();
+  }
+
+  std::shared_ptr<SSLKey> key(new SSLKey(_keySize, _ivLength));
+
+  memcpy(key->buffer, tmpBuf, (size_t)_keySize + (size_t)_ivLength);
+  memset(tmpBuf, 0, sizeof(tmpBuf));
+
+  initKey(key, _blockCipher, _streamCipher, _keySize);
+
+  return key;
 }
 
+void SSL_Cipher::writeKey(const CipherKey& ckey, unsigned char* data,
+    const CipherKey& masterKey) {
+  std::shared_ptr<SSLKey> key = dynamic_pointer_cast<SSLKey>(ckey);
+  rAssert(key->keySize == _keySize);
+  rAssert(key->ivLength == _ivLength);
+
+  std::shared_ptr<SSLKey> mk = dynamic_pointer_cast<SSLKey>(masterKey);
+  rAssert(mk->keySize == keySize);
+  rAssert(mk->ivlength == _ivLength);
+
+  unsigned char tmpBuf[MAX_KEYLENGTH + MAX_IVLENGTH];
+
+  int bufLen = _keySize + _ivLength;
+  memcpy(tmpBuf, key->buffer, bufLen);
+
+  unsigned int checksum = MAC_32(tmpBuf, bufLen, masterKey);
+
+  for (int i = 1; i <= KEY_CHECKSUM_BYTES; ++i) {
+    data[KEY_CHECKSUM_BYTES - i] = checksum & 0xff;
+    checksum >>= 8;
+  }
+
+  memset(tmpBuf, 0, sizeof(tmpBuf));
+}
+
+bool SSL_Cipher::compareKey(const CipherKey& A, const CipherKey& B) const {
+  std::shared_ptr<SSLKey> key1 = dynamic_pointer_cast<SSLKey>(A);
+  std::shared_ptr<SSLKey> key2 = dynamic_pointer_cast<SSLKey>(B);
+
+  rAssert(key1->keySize == _keySize);
+  rAssert(key2->keySize == _keySize);
+
+  return memcmp(key1->buffer, key2->buffer, (size_t)_keySize + (size_t)_ivLength) == 0;
+}
+
+int SSL_Cipher::encodedKeySize() const {
+  return _keySize + _ivLength + KEY_CHECKSUM_BYTES;
+}
+
+int SSL_Cipher::keySize() const { return _keySize; }
+
+int SSL_Cipher::cipherBlockSize() const {
+  return EVP_CIPHER_block_size(_blockCipher);
+}
+
+
+void SSL_Cipher::setIVec(unsigned char* ivec, uint64_t seed,
+    const std::shared_ptr<SSLKey>& key) const {
+  if (iface.current() >= 3) {
+    memcpy(ivec, IVData(key), _ivLength);
+
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdLen = EVP_MAX_MD_SIZE;
+
+    for (int i = 0; i < 8; ++i) {
+      md[i] = (unsigned char) (seed & 0xff);
+      seed >>= 8;
+    }
+    HMAC_Init_ex(key->mac_ctx, nullptr, 0, nullptr, nullptr);
+    HMAC_Update(key->mac_ctx, ivec, _ivLength);
+    HMAC_Update(key->mac_ctx, md, 8);
+    HMAC_Final(key->mac_ctx, md, &mdLen);
+    rAssert(mdLen >= _ivLength);
+
+    memcpy(ivec, md, _ivLength);
+  } else {
+    setIVec_old(ivec, seed, key);
+  }
+}
+
+void SSL_Cipher::setIVec_old(unsigned char* ivec, unsigned int seed,
+    const std::shared_ptr<SSLKey>& key) const {
+  unsigned int var1 = 0x060a4011 * seed;
+  unsigned int var2 = 0x0221040d * (seed ^ 0xD3FEA11C);
+
+  memcpy(ivec, IVData(key), _ivLength);
+
+  ivec[0] ^= (var1 >> 24) & 0xff;
+  ivec[1] ^= (var2 >> 16) & 0xff;
+  ivec[2] ^= (var1 >> 8) & 0xff;
+  ivec[3] ^= (var2)&0xff;
+  ivec[4] ^= (var2 >> 24) & 0xff;
+  ivec[5] ^= (var1 >> 16) & 0xff;
+  ivec[6] ^= (var2 >> 8) & 0xff;
+  ivec[7] ^= (var1)&0xff;
+
+  if (_ivLength > 8) {
+    ivec[8 + 0] ^= (var1)&0xff;
+    ivec[8 + 1] ^= (var2 >> 8) & 0xff;
+    ivec[8 + 2] ^= (var1 >> 16) & 0xff;
+    ivec[8 + 3] ^= (var2 >> 24) & 0xff;
+    ivec[8 + 4] ^= (var1 >> 24) & 0xff;
+    ivec[8 + 5] ^= (var2 >> 16) & 0xff;
+    ivec[8 + 6] ^= (var1 >> 8) & 0xff;
+    ivec[8 + 7] ^= (var2)&0xff;
+  }
+}
+
+static void flipBytes(unsigned char* buf, int size) {
+  unsigned char revBuf[64];
+
+  int bytesLeft = size;
+  while (bytesLeft != 0) {
+    int toFlip = std::min<int>(sizeof(revBuf), bytesLeft);
+
+    for (int i = 0; i < toFlip; ++i) {
+      revBuf[i] = buf[toFlip - (i+1)];
+    }
+
+    memcpy(buf, revBuf, toFlip);
+    bytesLeft -= toFlip;
+    buf += toFlip;
+  }
+
+  memset(revBuf, 0, sizeof(revBuf));
+}
+
+static void shuffleBytes(unsigned char* buf, int size) {
+  for (int i = 0; i < size - 1; ++i) {
+    buf[i+1] ^= buf[i];
+  }
+}
+
+static void unshuffleBytes(unsigned char* buf, int size) {
+  for (int i = size-1; i != 0; --i) {
+    buf[i] ^= buf[i-1];
+  }
+}
+
+bool SSL_Cipher::streamEncode(unsigned char* buf, int size, uint64_t iv64,
+    const CipherKey& ckey) const {
+  rAssert(size > 0);
+  std::shared_ptr<SSLKey> key = dynamic_pointer_cast<SSLKey>(ckey);
+  rAssert(key->keySize == _keySize);
+  rAssert(key->ivLength == _ivLength);
+
+  Lock lock(key->mutex);
+
+  unsigned char ivec[MAX_IVLENGTH];
+  int dstLen = 0, tmpLen = 0;
+
+  shuffleBytes(buf, size);
+
+  setIVec(ivec, iv64, key);
+  EVP_EncryptInit_ex(key->stream_enc, nullptr, nullptr, nullptr, ivec);
+  EVP_EncryptUpdate(key->stream_enc, buf, &dstlen, buf, size);
+  EVP_EncryptFinal_ex(key->stream_enc, buf + dstLen, &tmpLen);
+
+  flipBytes(buf, size);
+  shuffleBytes(buf, size);
+
+  setIVec(ivec, iv64+1, key);
+  EVP_EncryptInit_ex(key->stream_enc, nullptr, nullptr, nullptr, ivec);
+  EVP_EncryptUpdate(key->stream_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(key->stream_enc, buf+dstLen, &tmpLen);
+
+  dstLen += tmpLen;
+  if (dstLen != size) {
+    RLOG(ERROR) << "encoding " << size << " bytes, got back " << dstLen << " ("
+                << tmpLen << " in final_ex)";
+    return false;
+  }
+  return true;
+}
+
+bool SSL_Cipher::streamDecode(unsigned char* buf, int size, uint64_t iv64,
+    const Cipherkey& ckey) const {
+  rAssert(size > 0);
+  std::shared_ptr<SSLKey> key = dynamic_pointer_cast<SSLKey>(ckey);
+  rAssert(key->keySize == _keySize);
+  rAssert(key->ivLength == _ivLength);
+
+  Lock lock(key->mutex);
+
+  unsigned char ivec[MAX_IVLENGTH];
+  int dstLen = 0, tmpLen = 0;
+
+  setIVec(ivec, iv64 + 1, key);
+  EVP_DecryptInit_ex(key->stream_dec, nullptr, nullptr, nullptr, ivec);
+  EVP_DecryptUpdate(key->stream_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(key->stream_dec, buf + dstLen, &tmpLen);
+
+  unshuffleBytes(buf, size);
+  flipBytes(buf, size);
+
+  setIVec(ivec, iv64, key);
+  EVP_DecryptInit_ex(key->stream_dec, nullptr, nullptr, nullptr, ivec);
+  EVP_DecryptUpdate(key->stream_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(key->stream_dec, buf + dstLen, &tmpLen);
+
+  unshuffleBytes(buf, size);
+
+  dstLen += tmpLen;
+  if (dstLen != size) {
+    RLOG(ERROR) << "decoding " << size << " bytes, got back " << dstLen << " ("
+                << tmpLen << " in final_ex)";
+    return false;
+  }
+
+  return true;
+
+}
+
+bool SSL_Cipher::blockEncode(unsigned char *buf, int size, uint64_t iv64,
+                             const CipherKey &ckey) const {
+  rAssert(size > 0);
+  std::shared_ptr<SSLKey> key = dynamic_pointer_cast<SSLKey>(ckey);
+  rAssert(key->keySize == _keySize);
+  rAssert(key->ivLength == _ivLength);
+
+  // data must be integer number of blocks
+  const int blockMod = size % EVP_CIPHER_CTX_block_size(key->block_enc);
+  if (blockMod != 0) {
+    RLOG(ERROR) << "Invalid data size, not multiple of block size";
+    return false;
+  }
+
+  Lock lock(key->mutex);
+
+  unsigned char ivec[MAX_IVLENGTH];
+
+  int dstLen = 0, tmpLen = 0;
+  setIVec(ivec, iv64, key);
+
+  EVP_EncryptInit_ex(key->block_enc, nullptr, nullptr, nullptr, ivec);
+  EVP_EncryptUpdate(key->block_enc, buf, &dstLen, buf, size);
+  EVP_EncryptFinal_ex(key->block_enc, buf + dstLen, &tmpLen);
+  dstLen += tmpLen;
+
+  if (dstLen != size) {
+    RLOG(ERROR) << "encoding " << size << " bytes, got back " << dstLen << " ("
+                << tmpLen << " in final_ex)";
+    return false;
+  }
+
+  return true;
+}
+
+bool SSL_Cipher::blockDecode(unsigned char *buf, int size, uint64_t iv64,
+                             const CipherKey &ckey) const {
+  rAssert(size > 0);
+  std::shared_ptr<SSLKey> key = dynamic_pointer_cast<SSLKey>(ckey);
+  rAssert(key->keySize == _keySize);
+  rAssert(key->ivLength == _ivLength);
+
+  // data must be integer number of blocks
+  const int blockMod = size % EVP_CIPHER_CTX_block_size(key->block_dec);
+  if (blockMod != 0) {
+    RLOG(ERROR) << "Invalid data size, not multiple of block size";
+    return false;
+  }
+
+  Lock lock(key->mutex);
+
+  unsigned char ivec[MAX_IVLENGTH];
+
+  int dstLen = 0, tmpLen = 0;
+  setIVec(ivec, iv64, key);
+
+  EVP_DecryptInit_ex(key->block_dec, nullptr, nullptr, nullptr, ivec);
+  EVP_DecryptUpdate(key->block_dec, buf, &dstLen, buf, size);
+  EVP_DecryptFinal_ex(key->block_dec, buf + dstLen, &tmpLen);
+  dstLen += tmpLen;
+
+  if (dstLen != size) {
+    RLOG(ERROR) << "decoding " << size << " bytes, got back " << dstLen << " ("
+                << tmpLen << " in final_ex)";
+    return false;
+  }
+
+  return true;
+}
+
+bool SSL_Cipher::Enabled() { return true; }
 
 
 
